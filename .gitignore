@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+Cargo.lock
+.embuild/
+sdkconfig
+sdkconfig.old
+.DS_Store

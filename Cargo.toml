@@ -1,0 +1,39 @@
+[package]
+name = "buoyant-esp32p4"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.79"
+description = "Hardware-accelerated Buoyant render target for ESP32-P4 (PPA + MIPI-DSI)."
+license = "MIT"
+repository = "https://github.com/leonce-aklin/buoyant-esp32p4"
+keywords = ["buoyant", "esp32", "esp32p4", "embedded", "graphics"]
+categories = ["embedded", "no-std", "graphics"]
+readme = "README.md"
+
+[dependencies]
+# Upstream UI framework. The crate exposes the `RenderTarget` trait we
+# implement; see `RENDERER_INTERNALS.md` upstream for trait stability notes.
+buoyant = { version = "0.7.0-alpha.3", default-features = false, features = ["embedded-graphics"] }
+embedded-graphics = "0.8"
+
+[features]
+# `std` lets the crate use heap allocations and the upstream `std` features
+# of buoyant. Required when targeting esp-idf (which uses std). Off by
+# default so the trait skeleton can be checked from `cargo check` without
+# pulling in std.
+default = []
+std = ["buoyant/std"]
+
+# `esp-idf` enables the integration with the Espressif IDF runtime. Adds
+# the esp-idf-sys dependency for FFI access to the PPA driver and PSRAM
+# allocations. Implies `std` because esp-idf uses std.
+esp-idf = ["std", "dep:esp-idf-sys"]
+
+# `accel-ppa` flips on the ESP32-P4 PPA fast-paths. Until this is set, the
+# crate falls back to the existing software DrawTarget renderer. Implies
+# `esp-idf`.
+accel-ppa = ["esp-idf"]
+
+[dependencies.esp-idf-sys]
+version = "0.37"
+optional = true
