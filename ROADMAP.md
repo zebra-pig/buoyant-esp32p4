@@ -33,7 +33,7 @@ Goal: a buildable empty crate so subsequent phases have a place to land.
 - `cargo check` resolves dependencies without network surprises.
 - Initial commit on `main` branch.
 
-### Phase 1 — Trait skeleton with software fallback
+### Phase 1 — Trait skeleton with software fallback ✅
 
 Goal: a working `RenderTarget` impl that proves the wiring without any acceleration.
 

@@ -12,7 +12,7 @@ The crate is **board-agnostic**: it targets the ESP32-P4 SoC. Per-board panel + 
 
 ## Status
 
-Pre-implementation scaffold. The `RenderTarget` trait impl, PPA dispatch, and presentation pipeline arrive in subsequent commits.
+Phase 1 complete: `PpaRenderTarget` implements `buoyant::render_target::RenderTarget` as a transparent wrapper over `EmbeddedGraphicsRenderTarget`, behaving identically to the upstream software path. PPA dispatch and the MIPI-DSI present pipeline arrive in subsequent commits.
 
 See [`ROADMAP.md`](ROADMAP.md) for the phased plan and acceptance criteria per phase.
 
