@@ -10,6 +10,14 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+/// Thin Rust wrappers over the ESP-IDF PPA driver, PSRAM-aligned heap
+/// allocation, and cache-flush helpers. Only available when the
+/// `accel-ppa` feature is enabled (which implies `esp-idf`). The Buoyant
+/// trait methods on [`PpaRenderTarget`] start dispatching through these
+/// in Phase 4 of the roadmap.
+#[cfg(feature = "accel-ppa")]
+pub mod ppa;
+
 use buoyant::color::AlphaColor;
 use buoyant::font::FontRender;
 use buoyant::primitives::geometry::{Rectangle, Shape};

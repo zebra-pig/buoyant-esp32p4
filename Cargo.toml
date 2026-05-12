@@ -37,3 +37,13 @@ accel-ppa = ["esp-idf"]
 [dependencies.esp-idf-sys]
 version = "0.37"
 optional = true
+
+# When this crate is depended on with `accel-ppa` (or `esp-idf`) enabled,
+# esp-idf-sys aggregates this metadata from the dependency graph and
+# generates bindings for `driver/ppa.h` + heap-caps + cache APIs under
+# `esp_idf_sys::ppa::*`. The bindings only land in builds that *also*
+# target an ESP32-P4; on other ESP32 targets the PPA driver isn't built
+# and the symbols won't resolve at link time — gate accordingly.
+[[package.metadata.esp-idf-sys.extra_components]]
+bindings_header = "include/ppa_bindings.h"
+bindings_module = "ppa"

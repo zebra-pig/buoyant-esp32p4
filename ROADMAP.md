@@ -56,19 +56,17 @@ Originally scoped for CoreS3 SE because Tab5 wasn't on the bench yet. With a Tab
 
 **Acceptance:** met. Tab5 v1.3 silicon, 720×1280 MIPI-DSI, software path through `PpaRenderTarget`. No PPA dispatches yet — that's Phase 4+.
 
-### Phase 3 — esp-idf-sys + PPA driver wrapper module
+### Phase 3 — esp-idf-sys + PPA driver wrapper module ✅
 
 Goal: thin Rust wrappers over the ESP-IDF PPA driver. No Buoyant integration yet.
 
-**Deliverables:**
-- New `src/ppa.rs` module (gated behind `feature = "accel-ppa"`).
-- Wrappers for: `ppa_register_client`, `ppa_unregister_client`, `ppa_do_fill`, `ppa_do_blend`, `ppa_do_scale_rotate_mirror` (those are the IDF call names; verify against current esp-idf-sys bindings before relying on them).
-- Helper to allocate 64-byte-aligned framebuffers via `heap_caps_aligned_alloc(64, size, MALLOC_CAP_SPIRAM)`.
-- Cache flush helpers (`esp_cache_msync`) for buffers handed to the PPA.
+**Delivered:**
+- `src/ppa.rs` gated behind `feature = "accel-ppa"`. Exposes `Client::new_{fill,blend,srm}()` → drops via `ppa_unregister_client`, `do_fill/do_blend/do_srm` thin wrappers that translate `esp_err_t` into `Result`, `PsramBuffer::new(size)` for 64-byte aligned PSRAM allocations with `heap_caps_aligned_alloc(64, …, MALLOC_CAP_SPIRAM)` and RAII drop, plus `msync_flush` / `msync_invalidate` over `esp_cache_msync`.
+- `include/ppa_bindings.h` (driver/ppa.h + heap-caps + esp_cache + soc_caps) declared in `Cargo.toml` as `[[package.metadata.esp-idf-sys.extra_components]]` with `bindings_module = "ppa"`. esp-idf-sys aggregates this from the dep graph, so any consumer enabling `accel-ppa` gets `esp_idf_sys::ppa::*` symbols automatically — no per-project header edits needed.
 
-**Acceptance:**
-- The `ppa` module compiles when targeting `xtensa-esp32s3-espidf` even though those targets don't have PPA — symbols may be missing; `cfg(target_chip = "esp32p4")` gates keep S3 builds clean.
-- Builds cleanly when targeting `riscv32imac-esp-espidf` (the P4 target triple).
+**Acceptance:** met. Crate builds clean on the host with default features; firmware-tab5 with `accel-ppa` enabled compiles for `riscv32imafc-esp-espidf` and runs identically on Tab5 v1.3 hardware (counter UI behaves the same — Phase 3 binds the API but doesn't yet call it).
+
+> Roadmap pre-update notes referenced `riscv32imac-esp-espidf` and a per-target `cfg(target_chip)`. The actual target triple for ESP32-P4 (FPU present) is `riscv32imafc-esp-espidf`, and the cleaner gate is the `accel-ppa` Cargo feature itself — consumers that don't target P4 simply don't enable it.
 
 ### Phase 4 — PPA-accelerated `clear`
 
