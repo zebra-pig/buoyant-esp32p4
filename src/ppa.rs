@@ -974,7 +974,6 @@ where
             }
             Ok(())
         } else {
-            use embedded_graphics::draw_target::DrawTarget;
             use embedded_graphics::Pixel;
             self.base.draw_iter(core::iter::once(Pixel(
                 embedded_graphics::geometry::Point::new(x, y),
