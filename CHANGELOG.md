@@ -40,6 +40,10 @@ First public release. Phases 0–9 of the project [`ROADMAP.md`](ROADMAP.md) com
 
 ### Known limitations
 
-See [`README.md`'s "v0 limitations" section](README.md#v0-limitations). The main one: `LayerHandle::clip` and `LayerHandle::transform` are silently dropped inside opacity layers — pure `.opacity(α)` works correctly, but `.clip_to(rect).opacity(α)` misclips. Fix needs upstream Buoyant exposing direct `LayerConfig` introspection so we can probe alpha without consuming the `FnOnce` `layer_fn`.
+See [`README.md`'s "v0 limitations" section](README.md#v0-limitations). The main one: `PpaLayeredFramebuffer` always allocates a full-screen ARGB8888 scratch buffer on each opacity-layer push (3.7 MiB at 720×1280); bounding-box-aware allocation is a future optimisation that would shrink the first-push cost dramatically for small layers.
+
+### Fixed during development
+
+- `PpaLayeredRenderTarget::with_layer` initially short-circuited the α=255 path to `draw_fn(self)` directly, which accidentally suppressed `LayerHandle::hint_background` propagation to the inner `EmbeddedGraphicsRenderTarget`. Buoyant uses that hint to drive glyph anti-aliasing (lerping partial-coverage pixels toward the background colour), so text rendered jagged whenever a view used `.hint_background_color()`. The α=255 path now synthesises an equivalent `layer_fn` against EGRT's `LayerHandle`, preserving clip / transform / background-hint composition. Mathematically identical to direct delegation for the cases Buoyant invokes; verified visually on Tab5.
 
 [0.1.0]: https://github.com/zebra-pig/buoyant-esp32p4/releases/tag/v0.1.0

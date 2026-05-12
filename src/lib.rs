@@ -320,24 +320,26 @@ where
         LayerFn: FnOnce(LayerHandle<Self::ColorFormat>) -> LayerHandle<Self::ColorFormat>,
         DrawFn: FnOnce(&mut Self),
     {
-        // Probe layer_fn on a fresh LayerConfig to read the resulting
-        // alpha. LayerFn is `FnOnce`, so the probe consumes it — for
-        // the α = 255 path we can't replay the layer_fn against EGRT.
-        // Synthesising an equivalent layer_fn is not safe in the
-        // general case (probed clip/transform live in global
-        // coordinates relative to identity; re-applying them through
-        // EGRT's LayerHandle methods would double-transform when EGRT
-        // already has a non-identity transform from a parent layer).
+        // Probe layer_fn against a fresh `LayerConfig` to capture its
+        // effect (alpha, clip, transform, background hint). `LayerFn`
+        // is `FnOnce`, so this consumes the closure; we synthesise an
+        // equivalent layer_fn for the EGRT call below.
         //
-        // **v0 limitation**: clip and transform from a `LayerHandle`
-        // are silently dropped at the boundary of every `with_layer`
-        // invocation. The PPA path applies the layer's alpha cleanly,
-        // but a `view.clip_to(rect).opacity(α)` view will fail to
-        // clip. The counter UI doesn't use clip or transform inside
-        // opacity layers; UIs that do should fall back to
-        // `PpaRenderTarget` and pay the software cost until upstream
-        // Buoyant exposes direct `LayerConfig` introspection (then
-        // we can recover clip/transform correctly).
+        // The synth path is mathematically equivalent to direct
+        // delegation for typical view-tree usage: `LayerHandle::clip`,
+        // `transform`, and `hint_background` each compose with EGRT's
+        // current state the same way whether the user's `R` /
+        // `T_user` are applied directly or are pre-composed via our
+        // probe (the probe starts from identity / full-screen so
+        // probed values equal the user's intended ones modulo the
+        // existing parent state).
+        //
+        // The previously-shipped "α = 255 short-circuits to
+        // `draw_fn(self)`" variant accidentally suppressed
+        // `LayerHandle::hint_background`, which is how Buoyant
+        // propagates the background colour glyph rasterizers need
+        // for anti-aliased text. Restoring the synth fixes that
+        // regression.
         let mut probe = LayerConfig::new_sized(self.size());
         let _ = layer_fn(LayerHandle::new(&mut probe));
         let alpha = probe.alpha;
@@ -346,23 +348,53 @@ where
             return;
         }
 
+        let probed_clip = probe.clip_rect;
+        let probed_transform = probe.transform;
+        let probed_bg_hint = probe.background_hint;
+
         if alpha == 255 {
-            // No opacity work to accelerate. Run draw_fn directly
-            // against self — clip/transform from the layer_fn are
-            // dropped (see v0 limitation above), but the typical
-            // α = 255 path is a plain pass-through with no clip or
-            // transform anyway.
-            draw_fn(self);
+            self.inner.with_layer(
+                |mut h: LayerHandle<Self::ColorFormat>| {
+                    h = h.transform(&probed_transform);
+                    h = h.clip(&probed_clip);
+                    if let Some(bg) = probed_bg_hint {
+                        h = h.hint_background(bg);
+                    }
+                    h
+                },
+                |inner| {
+                    // SAFETY: `Self` is `#[repr(transparent)]` over the
+                    // exact type of `inner`. Same proof as
+                    // `PpaRenderTarget::with_layer`.
+                    let self_ref: &mut Self =
+                        unsafe { &mut *(inner as *mut _ as *mut Self) };
+                    draw_fn(self_ref);
+                },
+            );
             return;
         }
 
-        // PPA path. Push an ARGB8888 scratch layer onto the inner
-        // DrawTarget's layer stack (allocates on first use of this
-        // depth, reused thereafter), run the inner draw at full
-        // opacity into the scratch buffer, and pop with a PPA alpha
-        // blend onto whatever was underneath.
+        // α < 255 PPA path. Push a scratch layer onto the inner
+        // DrawTarget's layer stack, run the inner draw against an
+        // EGRT layer carrying the user's clip/transform/bg-hint (but
+        // alpha = 1, since we apply alpha at the PPA blend on pop),
+        // then pop with the PPA blend at the requested alpha.
         self.inner.display_mut().push_layer(alpha);
-        draw_fn(self);
+        self.inner.with_layer(
+            |mut h: LayerHandle<Self::ColorFormat>| {
+                h = h.transform(&probed_transform);
+                h = h.clip(&probed_clip);
+                if let Some(bg) = probed_bg_hint {
+                    h = h.hint_background(bg);
+                }
+                h
+            },
+            |inner| {
+                let self_ref: &mut Self =
+                    unsafe { &mut *(inner as *mut _ as *mut Self) };
+                draw_fn(self_ref);
+            },
+        );
         self.inner.display_mut().pop_layer_blend();
     }
 

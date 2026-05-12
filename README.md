@@ -122,7 +122,6 @@ Your Buoyant view code uses standard idioms — `.opacity(α)`, `Rectangle::new(
 
 The crate is at 0.1.0 — usable, with the following acknowledged constraints:
 
-- **`with_layer` clip and transform are silently dropped inside opacity layers.** `LayerHandle::clip(rect).opacity(α)` will misclip. Fix needs upstream Buoyant exposing direct `LayerConfig` introspection so we can probe alpha without consuming the `FnOnce` layer_fn. Pure `.opacity(α)` works correctly.
 - **`PpaLayeredFramebuffer` always allocates a full-screen ARGB8888 scratch buffer** (3.7 MiB on 720×1280) regardless of the layer's bounding box. Bounding-box-aware allocation is a future optimisation.
 - **First opacity-layer push costs ~92 ms** on a 720×1280 panel: PSRAM scratch alloc + zero-init + full-screen PPA blend. Use `PpaLayeredFramebuffer::reserve_layers(N)` at startup to amortise.
 - **Nested opacity layers** software-composite instead of PPA-blending. The PPA could do ARGB→ARGB blend but our `PpaBlendTarget` is configured for RGB565 output; nested case is rare in practice.
