@@ -190,16 +190,40 @@ Note: the counter UI updates infrequently (only on touch events) and renders a s
 
 **Triple buffering** (the original "if the GPU outpaces the panel" stretch goal) is unimplemented — `BSP_LCD_DPI_BUFFER_NUMS` supports up to 3, so it's a one-line config bump if we ever start outpacing vsync on this UI. Not currently a constraint.
 
-### Phase 9 — `bsp-tab5` companion crate
+### Phase 9 — `bsp-tab5` companion crate ✅
 
-Goal: thin Rust wrappers around M5Stack's ESP-IDF BSP for the Tab5 (panel init, GT911 touch, AXP power).
+Goal: thin Rust wrappers around M5Stack's ESP-IDF BSP for the Tab5 (panel init, GT911/ST7123 touch, PMU, DPI buffer pool).
 
-**Deliverables:**
-- `bsp-tab5/` crate (sibling, separate `Cargo.toml`, possibly a workspace).
-- `Tab5::take()` returns a tuple of (`PpaRenderTarget`, touch tracker, …) ready for use.
+**Delivered:** as a sibling crate to `firmware-tab5` inside the `rlvgl-starter` workspace (`rlvgl-starter/bsp-tab5/`). Library crate, workspace-excluded (same convention as the firmware crates so a host `cargo build` doesn't try to compile it).
 
-**Acceptance:**
-- A Tab5 example boots, runs the counter UI, accepts touch input, no panel init code in the example.
+Public surface:
+
+- `Tab5::take() -> anyhow::Result<Tab5>` — single entry point. Brings up `bsp_i2c_init` → `bsp_display_new` (with the `mipi_dsi_phy_pllref_clk_src_t::DEFAULT_LEGACY` / 1 Gbps config the BSP requires; passing NULL faults the BSP) → `esp_lcd_panel_disp_on_off` → `bsp_touch_new` → `esp_lcd_dpi_panel_get_frame_buffer(panel, 2, …)` → three PPA clients (FILL / SRM / BLEND). Returns a `Tab5` whose public fields expose the panel + IO handles, the touch handle, a `DoubleBuffer`, the three `ppa::Client`s, and a `TouchTracker`.
+- `Tab5::poll_touch()` — synthesise Buoyant `Event::Touch` events from the GT911/ST7123.
+- `Tab5::set_brightness(percent: i32)`, `Tab5::backlight_on / off()`.
+- `DoubleBuffer { fb_a, fb_b, back_is_a }` with `back_ptr()` and `present(panel)`.
+- `Framebuffer` — thin RGB565 `embedded-graphics::DrawTarget` view over a borrowed `*mut u8`.
+- `Rgb888Adapter<'a, D>` — Rgb888 ↔ Rgb565 conversion adapter, **forwards `buoyant_esp32p4::ppa::LayerStack`** so `PpaLayeredRenderTarget` can wrap it directly.
+- `TouchTracker` — GT911/ST7123 → `buoyant::event::Event::Touch` state machine with phase synthesis.
+- Constants `FB_WIDTH = 720`, `FB_HEIGHT = 1280`, `FB_BYTES`, `FB_PIXELS`, `PPA_ALIGN = 64`.
+- `rgb888_to_565` / `rgb888_to_565_packed` colour helpers.
+
+The BSP component itself is pulled in via `[[package.metadata.esp-idf-sys.extra_components]]` *in `bsp-tab5/Cargo.toml`*, not in the consuming binary crate. `esp-idf-sys` aggregates `extra_components` metadata across the entire dependency graph, so downstream binaries don't need their own `bsp_bindings.h`.
+
+**Acceptance:** met. `rlvgl-starter/firmware-tab5` is now a thin shell around `bsp_tab5::Tab5::take()`: the previous ~700-line `main.rs` (init + types + render loop + benches) became ~370 lines, of which only the render loop, the boot benches, and a `render_frame` helper are application code — every line of init/wrapping was deleted in favour of the crate API.
+
+Validated on Tab5 v1.3, identical counter UI to pre-refactor:
+
+| Stage | Pre-Phase 9 | Phase 9 |
+|---|---:|---:|
+| `Phase 4 bench (full-frame)` | software=29214us PPA=5318us | software=29231us PPA=5318us (no regression) |
+| `Phase 6 bench upscale 100→400` | software=9654us PPA=547us 17.7× | software=7522us PPA=536us 14.0× |
+| `Phase 7 bench 400×300 α=128` | software=23934us PPA=4029us | software=23970us PPA=4096us 5.85× |
+| Steady frame | clear=5213us render=3534us present=216us | clear=5216us render=3176us present=139us |
+
+Bench variation is run-to-run noise; no measurable refactor cost.
+
+**Not yet:** higher-level helpers like a `tab5.render(|target| { … })` closure that builds the whole `PpaLayeredRenderTarget<Rgb888Adapter<PpaLayeredFramebuffer<PpaDrawTarget<Framebuffer>>>>` wrapper stack internally. The concrete type name is unwieldy and using `impl Trait` in the closure parameter runs into `for<'a>` HRTB inference issues that would need careful design. For v0, the consumer builds the stack inline (see `firmware-tab5/src/main.rs::render_frame`) — it's ~6 lines and the type inference works.
 
 ### Phase 10 — `bsp-d1001` companion crate
 
