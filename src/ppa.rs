@@ -303,8 +303,21 @@ impl<'a> PpaFillTarget<'a> {
     /// until the PPA finishes the transaction and the destination
     /// cache lines are invalidated.
     pub fn clear(&self, fill_val: u32) -> Result<(), sys::esp_err_t> {
-        // Build the per-frame config. The unions are zeroed via Default
-        // and then the active variant is set explicitly.
+        self.fill_rect(0, 0, self.width, self.height, fill_val)
+    }
+
+    /// Fill a sub-rectangle `[x, x+w) × [y, y+h)` of the framebuffer
+    /// with `fill_val`. Same semantics and constraints as [`Self::clear`].
+    /// Clipping to the framebuffer bounds is the caller's responsibility
+    /// — the PPA driver will reject out-of-range coordinates.
+    pub fn fill_rect(
+        &self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        fill_val: u32,
+    ) -> Result<(), sys::esp_err_t> {
         let mut out_anon = sys::ppa::ppa_out_pic_blk_config_t__bindgen_ty_1::default();
         out_anon.fill_cm = self.color_mode;
         let mut fill_anon = sys::ppa::ppa_fill_oper_config_t__bindgen_ty_1::default();
@@ -315,14 +328,14 @@ impl<'a> PpaFillTarget<'a> {
                 buffer_size: self.framebuffer_bytes as u32,
                 pic_w: self.width,
                 pic_h: self.height,
-                block_offset_x: 0,
-                block_offset_y: 0,
+                block_offset_x: x,
+                block_offset_y: y,
                 __bindgen_anon_1: out_anon,
                 yuv_range: 0,
                 yuv_std: 0,
             },
-            fill_block_w: self.width,
-            fill_block_h: self.height,
+            fill_block_w: w,
+            fill_block_h: h,
             __bindgen_anon_1: fill_anon,
             mode: ppa_trans_mode_t_PPA_TRANS_MODE_BLOCKING,
             user_data: ptr::null_mut(),
@@ -333,3 +346,152 @@ impl<'a> PpaFillTarget<'a> {
 }
 
 unsafe impl<'a> Send for PpaFillTarget<'a> {}
+
+/// `embedded-graphics` [`DrawTarget`] wrapper that intercepts
+/// [`DrawTarget::fill_solid`] for sufficiently large rectangles and
+/// dispatches them to the PPA fill engine instead of going through the
+/// inner display's pixel-level path. All other methods pass through.
+///
+/// Phase 5 of the roadmap. Buoyant's `RenderTarget::fill(rect, solid_brush, …)`
+/// ultimately lowers to `embedded-graphics`'s `fill_solid`; intercepting
+/// there gets us PPA fast-paths for button backgrounds and other solid
+/// rectangles without touching [`crate::PpaRenderTarget`]'s `#[repr(transparent)]`
+/// invariant (which Phase 1's `with_layer` recast depends on).
+///
+/// The inner display must back its pixels with the same memory the
+/// `PpaFillTarget` was configured to point at — typically a single
+/// framebuffer struct that both this wrapper borrows mutably and the
+/// `PpaFillTarget` borrows the raw pointer of. The caller is
+/// responsible for that aliasing being well-behaved across the PPA
+/// dispatch boundary; the PPA path invalidates cache lines after the
+/// fill so subsequent CPU reads observe the fill.
+pub struct PpaDrawTarget<'a, D>
+where
+    D: embedded_graphics::draw_target::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>
+        + embedded_graphics::geometry::OriginDimensions,
+{
+    inner: &'a mut D,
+    fill_target: &'a PpaFillTarget<'a>,
+    /// Below this pixel count, fall through to the software path —
+    /// the PPA's per-transaction setup cost outweighs the bandwidth
+    /// win on tiny fills.
+    min_pixels_for_ppa: u32,
+}
+
+impl<'a, D> PpaDrawTarget<'a, D>
+where
+    D: embedded_graphics::draw_target::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>
+        + embedded_graphics::geometry::OriginDimensions,
+{
+    /// Wrap `inner` so its `fill_solid` calls dispatch through `fill_target`
+    /// when the area exceeds [`Self::min_pixels_for_ppa`].
+    pub fn new(inner: &'a mut D, fill_target: &'a PpaFillTarget<'a>) -> Self {
+        Self {
+            inner,
+            fill_target,
+            // Default crossover: roughly where the PPA's per-transaction
+            // setup cost (~100 µs on ESP32-P4) breaks even with CPU
+            // PSRAM writes (~30 ns/px). Below this we don't bother.
+            min_pixels_for_ppa: 4096,
+        }
+    }
+
+    /// Override the default PPA dispatch threshold.
+    pub fn with_min_pixels_for_ppa(mut self, n: u32) -> Self {
+        self.min_pixels_for_ppa = n;
+        self
+    }
+
+    /// Borrow the underlying display.
+    pub fn inner(&self) -> &D {
+        self.inner
+    }
+
+    /// Mutable counterpart of [`Self::inner`].
+    pub fn inner_mut(&mut self) -> &mut D {
+        self.inner
+    }
+}
+
+impl<'a, D> embedded_graphics::geometry::OriginDimensions for PpaDrawTarget<'a, D>
+where
+    D: embedded_graphics::draw_target::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>
+        + embedded_graphics::geometry::OriginDimensions,
+{
+    fn size(&self) -> embedded_graphics::geometry::Size {
+        self.inner.size()
+    }
+}
+
+impl<'a, D> embedded_graphics::draw_target::DrawTarget for PpaDrawTarget<'a, D>
+where
+    D: embedded_graphics::draw_target::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>
+        + embedded_graphics::geometry::OriginDimensions,
+{
+    type Color = embedded_graphics::pixelcolor::Rgb565;
+    type Error = D::Error;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = embedded_graphics::Pixel<Self::Color>>,
+    {
+        self.inner.draw_iter(pixels)
+    }
+
+    fn fill_contiguous<I>(
+        &mut self,
+        area: &embedded_graphics::primitives::Rectangle,
+        colors: I,
+    ) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Self::Color>,
+    {
+        self.inner.fill_contiguous(area, colors)
+    }
+
+    fn fill_solid(
+        &mut self,
+        area: &embedded_graphics::primitives::Rectangle,
+        color: Self::Color,
+    ) -> Result<(), Self::Error> {
+        use embedded_graphics::pixelcolor::raw::RawData;
+        let pixels = area.size.width.saturating_mul(area.size.height);
+        let display_size = self.inner.size();
+
+        // Bail to software for sub-threshold fills and any area that
+        // strays off-display (the PPA refuses out-of-range coordinates;
+        // letting embedded-graphics handle clipping is cheaper than
+        // reproducing it here).
+        let in_bounds = area.top_left.x >= 0
+            && area.top_left.y >= 0
+            && area.top_left.x as u32 + area.size.width <= display_size.width
+            && area.top_left.y as u32 + area.size.height <= display_size.height;
+
+        if pixels < self.min_pixels_for_ppa || !in_bounds {
+            return self.inner.fill_solid(area, color);
+        }
+
+        let raw =
+            embedded_graphics::pixelcolor::raw::RawU16::from(color).into_inner() as u32;
+        match self.fill_target.fill_rect(
+            area.top_left.x as u32,
+            area.top_left.y as u32,
+            area.size.width,
+            area.size.height,
+            raw,
+        ) {
+            Ok(()) => Ok(()),
+            Err(_) => self.inner.fill_solid(area, color),
+        }
+    }
+
+    fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
+        use embedded_graphics::pixelcolor::raw::RawData;
+        let raw =
+            embedded_graphics::pixelcolor::raw::RawU16::from(color).into_inner() as u32;
+        match self.fill_target.clear(raw) {
+            Ok(()) => Ok(()),
+            Err(_) => self.inner.clear(color),
+        }
+    }
+}
