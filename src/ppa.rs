@@ -24,7 +24,11 @@ use sys::ppa::{
 };
 
 pub use sys::ppa::{
-    ppa_alpha_update_mode_t, ppa_alpha_update_mode_t_PPA_ALPHA_NO_CHANGE, ppa_blend_oper_config_t,
+    ppa_alpha_update_mode_t, ppa_alpha_update_mode_t_PPA_ALPHA_FIX_VALUE,
+    ppa_alpha_update_mode_t_PPA_ALPHA_NO_CHANGE, ppa_alpha_update_mode_t_PPA_ALPHA_SCALE,
+    ppa_blend_color_mode_t, ppa_blend_color_mode_t_PPA_BLEND_COLOR_MODE_ARGB8888,
+    ppa_blend_color_mode_t_PPA_BLEND_COLOR_MODE_RGB565,
+    ppa_blend_color_mode_t_PPA_BLEND_COLOR_MODE_RGB888, ppa_blend_oper_config_t,
     ppa_fill_color_mode_t, ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_ARGB8888,
     ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_RGB565,
     ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_RGB888, ppa_fill_oper_config_t, ppa_operation_t,
@@ -496,6 +500,183 @@ impl<'a> PpaSrmTarget<'a> {
 
 unsafe impl<'a> Send for PpaSrmTarget<'a> {}
 
+/// Phase 7 building block: a bound output framebuffer the PPA blend
+/// engine can composite into. Parallel to [`PpaFillTarget`] and
+/// [`PpaSrmTarget`]. Holds a borrowed blend-mode [`Client`] plus the
+/// destination buffer's pointer, byte size, and dimensions (always
+/// interpreted as RGB565 — the only background color mode we support
+/// today).
+///
+/// Source buffers passed to [`Self::blend_argb_over_rgb565`] must be
+/// ARGB8888, 64-byte aligned, and in DMA-capable memory. The
+/// implementation flushes the source's cache lines before submitting
+/// and invalidates the destination's afterward.
+pub struct PpaBlendTarget<'a> {
+    client: &'a Client,
+    framebuffer_ptr: *mut u8,
+    framebuffer_bytes: usize,
+    width: u32,
+    height: u32,
+}
+
+impl<'a> PpaBlendTarget<'a> {
+    /// Bind a blend client to an RGB565 destination framebuffer.
+    ///
+    /// # Safety
+    /// Same as [`PpaFillTarget::new`].
+    pub unsafe fn new(
+        client: &'a Client,
+        framebuffer_ptr: *mut u8,
+        framebuffer_bytes: usize,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            client,
+            framebuffer_ptr,
+            framebuffer_bytes,
+            width,
+            height,
+        }
+    }
+
+    /// Alpha-blend an ARGB8888 source over the bound RGB565 framebuffer
+    /// at `(dst_x, dst_y)`. `scalar_alpha` is the layer-level opacity
+    /// (0-255); it's multiplied with the source's per-pixel alpha via
+    /// the PPA's `PPA_ALPHA_SCALE` mode. Untouched source pixels
+    /// (per-pixel alpha = 0) leave the destination unchanged; fully
+    /// opaque source pixels (per-pixel alpha = 255) blend at
+    /// `scalar_alpha / 255` strength.
+    ///
+    /// The destination is read by the PPA (it needs the current
+    /// framebuffer contents to compute the over-blend) and written
+    /// back. The destination block geometry is `src_w × src_h` starting
+    /// at `(dst_x, dst_y)`.
+    ///
+    /// # Safety
+    /// `src_argb_ptr` must point at a writable allocation of at least
+    /// `src_w * src_h * 4` bytes, 64-byte aligned, in DMA-capable
+    /// memory, valid for the duration of the call. The framebuffer
+    /// region `[(dst_x, dst_y), (dst_x + src_w, dst_y + src_h))` must
+    /// lie within the bound framebuffer.
+    pub unsafe fn blend_argb_over_rgb565(
+        &self,
+        src_argb_ptr: *const u8,
+        src_w: u32,
+        src_h: u32,
+        dst_x: u32,
+        dst_y: u32,
+        scalar_alpha: u8,
+    ) -> Result<(), sys::esp_err_t> {
+        let src_bytes = (src_w as usize) * (src_h as usize) * 4;
+        msync_flush(src_argb_ptr, src_bytes)?;
+        // Also flush the destination so the PPA reads up-to-date
+        // pre-blend pixels (the CPU may have written into the FB
+        // earlier in this frame).
+        msync_flush(self.framebuffer_ptr, self.framebuffer_bytes)?;
+
+        let mut bg_anon = sys::ppa::ppa_in_pic_blk_config_t__bindgen_ty_1::default();
+        bg_anon.blend_cm = ppa_blend_color_mode_t_PPA_BLEND_COLOR_MODE_RGB565;
+        let mut fg_anon = sys::ppa::ppa_in_pic_blk_config_t__bindgen_ty_1::default();
+        fg_anon.blend_cm = ppa_blend_color_mode_t_PPA_BLEND_COLOR_MODE_ARGB8888;
+        let mut out_anon = sys::ppa::ppa_out_pic_blk_config_t__bindgen_ty_1::default();
+        out_anon.blend_cm = ppa_blend_color_mode_t_PPA_BLEND_COLOR_MODE_RGB565;
+        let mut bg_alpha_anon = sys::ppa::ppa_blend_oper_config_t__bindgen_ty_1::default();
+        bg_alpha_anon.bg_alpha_fix_val = 255;
+        // FG alpha: PPA_ALPHA_SCALE multiplies the per-pixel alpha by
+        // this ratio. Range (0, 1); 0 isn't usable so clamp.
+        let scale = (scalar_alpha as f32 / 255.0).clamp(1.0 / 256.0, 1.0);
+        let mut fg_alpha_anon = sys::ppa::ppa_blend_oper_config_t__bindgen_ty_2::default();
+        fg_alpha_anon.fg_alpha_scale_ratio = scale;
+
+        let cfg = ppa_blend_oper_config_t {
+            in_bg: sys::ppa::ppa_in_pic_blk_config_t {
+                buffer: self.framebuffer_ptr as *const c_void,
+                pic_w: self.width,
+                pic_h: self.height,
+                block_w: src_w,
+                block_h: src_h,
+                block_offset_x: dst_x,
+                block_offset_y: dst_y,
+                __bindgen_anon_1: bg_anon,
+                yuv_range: 0,
+                yuv_std: 0,
+            },
+            in_fg: sys::ppa::ppa_in_pic_blk_config_t {
+                buffer: src_argb_ptr as *const c_void,
+                pic_w: src_w,
+                pic_h: src_h,
+                block_w: src_w,
+                block_h: src_h,
+                block_offset_x: 0,
+                block_offset_y: 0,
+                __bindgen_anon_1: fg_anon,
+                yuv_range: 0,
+                yuv_std: 0,
+            },
+            out: sys::ppa::ppa_out_pic_blk_config_t {
+                buffer: self.framebuffer_ptr as *mut c_void,
+                buffer_size: self.framebuffer_bytes as u32,
+                pic_w: self.width,
+                pic_h: self.height,
+                block_offset_x: dst_x,
+                block_offset_y: dst_y,
+                __bindgen_anon_1: out_anon,
+                yuv_range: 0,
+                yuv_std: 0,
+            },
+            bg_rgb_swap: false,
+            bg_byte_swap: false,
+            bg_alpha_update_mode: ppa_alpha_update_mode_t_PPA_ALPHA_NO_CHANGE,
+            __bindgen_anon_1: bg_alpha_anon,
+            fg_rgb_swap: false,
+            fg_byte_swap: false,
+            fg_alpha_update_mode: ppa_alpha_update_mode_t_PPA_ALPHA_SCALE,
+            __bindgen_anon_2: fg_alpha_anon,
+            fg_fix_rgb_val: sys::ppa::color_pixel_rgb888_data_t::default(),
+            bg_ck_en: false,
+            bg_ck_rgb_low_thres: sys::ppa::color_pixel_rgb888_data_t::default(),
+            bg_ck_rgb_high_thres: sys::ppa::color_pixel_rgb888_data_t::default(),
+            fg_ck_en: false,
+            fg_ck_rgb_low_thres: sys::ppa::color_pixel_rgb888_data_t::default(),
+            fg_ck_rgb_high_thres: sys::ppa::color_pixel_rgb888_data_t::default(),
+            ck_rgb_default_val: sys::ppa::color_pixel_rgb888_data_t::default(),
+            ck_reverse_bg2fg: false,
+            mode: ppa_trans_mode_t_PPA_TRANS_MODE_BLOCKING,
+            user_data: ptr::null_mut(),
+        };
+        self.client.do_blend(&cfg)?;
+        msync_invalidate(self.framebuffer_ptr, self.framebuffer_bytes)
+    }
+}
+
+unsafe impl<'a> Send for PpaBlendTarget<'a> {}
+
+/// Phase 7 trait: a layer stack that a [`crate::PpaLayeredRenderTarget`]
+/// can drive. Buoyant's `view.opacity(α)` causes the renderer to call
+/// [`Self::push_layer`] before drawing the inner subtree and
+/// [`Self::pop_layer_blend`] after, at which point the implementation
+/// composites the captured contents onto whatever was underneath.
+///
+/// The framebuffer type the user supplies as the inner `D` implements
+/// this trait. [`PpaLayeredFramebuffer`] is the ready-made
+/// implementation that uses ARGB8888 PSRAM scratch buffers and PPA
+/// alpha-blend on pop.
+pub trait LayerStack {
+    /// Push a new layer onto the stack with the given scalar alpha.
+    /// Subsequent draws on the [`embedded_graphics::draw_target::DrawTarget`]
+    /// route to the new layer's scratch buffer instead of the layer
+    /// underneath.
+    fn push_layer(&mut self, alpha: u8);
+
+    /// Pop the top layer, alpha-composite its contents onto the layer
+    /// underneath (or the base framebuffer if this was the last
+    /// layer), and recycle the scratch buffer for the next push.
+    /// Errors during composition fall through silently — the visible
+    /// frame will be incorrect but the program continues.
+    fn pop_layer_blend(&mut self);
+}
+
 /// Bytes per pixel for an SRM color mode. Only the RGB modes are
 /// supported here; YUV needs more careful range/standard handling and
 /// can be added when there's a concrete need.
@@ -660,4 +841,301 @@ where
             Err(_) => self.inner.clear(color),
         }
     }
+}
+
+/// Phase 7: a layer-stack-aware `embedded-graphics` framebuffer wrapper
+/// that captures Buoyant `view.opacity(α)` regions into ARGB8888
+/// scratch buffers in PSRAM and PPA-blends them onto the base RGB565
+/// framebuffer on layer exit. Wraps any `DrawTarget<Color = Rgb565> +
+/// OriginDimensions` so it can sit on top of `PpaDrawTarget`
+/// (Phase 5) or a raw framebuffer.
+///
+/// Scratch buffers are allocated lazily on first `push_layer` and
+/// reused across frames; nothing is freed until the wrapper is
+/// dropped. Each buffer is `width × height × 4` bytes (full-screen
+/// ARGB8888) so any opacity layer of any size fits without per-push
+/// allocation churn. On a 720×1280 panel that's 3.7 MiB per layer;
+/// with 32 MiB PSRAM and a 1.84 MiB base FB there's room for a half-
+/// dozen concurrent layers before memory pressure matters.
+///
+/// Drawing semantics while layers are active: `fill_solid` and `clear`
+/// write into the top-of-stack ARGB8888 buffer with per-pixel alpha
+/// set to 255 (i.e. drawn pixels are opaque; untouched pixels keep
+/// their initial alpha = 0 from `push_layer`'s zero-init).
+/// `draw_iter` is supported but slow (per-pixel conversion through
+/// the standard DrawTarget path); `fill_contiguous` falls back to
+/// embedded-graphics's default looping over `draw_iter`. The PPA
+/// scalar alpha attached to the layer is applied at `pop_layer_blend`.
+///
+/// **Limitations**: only RGB565 base framebuffers, only scalar layer
+/// alpha (no per-pixel alpha brushes), and clip/transform from a
+/// `LayerHandle` are not honoured inside the opacity region — Buoyant's
+/// `with_layer` clip + transform paths still work, just not when
+/// composed with this wrapper's opacity layering. Document that
+/// limitation alongside the user-visible `PpaLayeredRenderTarget`.
+pub struct PpaLayeredFramebuffer<'a, D>
+where
+    D: embedded_graphics::draw_target::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>
+        + embedded_graphics::geometry::OriginDimensions,
+{
+    base: &'a mut D,
+    blend_target: &'a PpaBlendTarget<'a>,
+    width: u32,
+    height: u32,
+    /// LIFO pool of ARGB8888 scratch buffers. Index `active_layers` is
+    /// the next slot to fill on `push_layer`; indices below it are the
+    /// currently-active stack.
+    pool: std::vec::Vec<PsramBuffer>,
+    alphas: std::vec::Vec<u8>,
+    active_layers: usize,
+}
+
+impl<'a, D> PpaLayeredFramebuffer<'a, D>
+where
+    D: embedded_graphics::draw_target::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>
+        + embedded_graphics::geometry::OriginDimensions,
+{
+    /// Wrap a base RGB565 framebuffer. `blend_target` must be bound to
+    /// the same underlying memory as `base` (typically constructed
+    /// against the same raw pointer): the composite-on-pop step blends
+    /// the top scratch buffer over the base by submitting `ppa_do_blend`
+    /// with the framebuffer as both bg and out.
+    pub fn new(base: &'a mut D, blend_target: &'a PpaBlendTarget<'a>) -> Self {
+        let size = base.size();
+        Self {
+            base,
+            blend_target,
+            width: size.width,
+            height: size.height,
+            pool: std::vec::Vec::new(),
+            alphas: std::vec::Vec::new(),
+            active_layers: 0,
+        }
+    }
+
+    /// Pre-allocate `n` scratch buffers so the first N `push_layer`
+    /// calls don't pay the heap-cap allocation cost on the render
+    /// thread. Optional — the wrapper allocates lazily otherwise.
+    pub fn reserve_layers(&mut self, n: usize) -> Result<(), &'static str> {
+        let bytes = (self.width as usize) * (self.height as usize) * 4;
+        while self.pool.len() < n {
+            let buf = PsramBuffer::new(bytes)
+                .ok_or("PSRAM exhausted while reserving layer scratch")?;
+            self.pool.push(buf);
+        }
+        Ok(())
+    }
+
+    /// Number of layers currently pushed (0 when drawing directly to
+    /// the base framebuffer).
+    pub fn layer_depth(&self) -> usize {
+        self.active_layers
+    }
+
+    /// Write a single Rgb565 pixel at `(x, y)` into the active draw
+    /// target — either the top-of-stack ARGB8888 buffer (with alpha
+    /// promoted to 255) or, if no layers are active, the inner base
+    /// DrawTarget.
+    fn write_pixel(
+        &mut self,
+        x: i32,
+        y: i32,
+        color: embedded_graphics::pixelcolor::Rgb565,
+    ) -> Result<(), D::Error> {
+        if x < 0 || y < 0 || (x as u32) >= self.width || (y as u32) >= self.height {
+            return Ok(());
+        }
+        if self.active_layers > 0 {
+            let buf = &mut self.pool[self.active_layers - 1];
+            unsafe {
+                let off = (y as usize * self.width as usize + x as usize) * 4;
+                let ptr = buf.as_ptr_mut().add(off);
+                let argb = rgb565_to_argb8888_opaque(color);
+                core::ptr::write(ptr.cast::<u32>(), argb);
+            }
+            Ok(())
+        } else {
+            use embedded_graphics::draw_target::DrawTarget;
+            use embedded_graphics::Pixel;
+            self.base.draw_iter(core::iter::once(Pixel(
+                embedded_graphics::geometry::Point::new(x, y),
+                color,
+            )))
+        }
+    }
+}
+
+impl<'a, D> embedded_graphics::geometry::OriginDimensions for PpaLayeredFramebuffer<'a, D>
+where
+    D: embedded_graphics::draw_target::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>
+        + embedded_graphics::geometry::OriginDimensions,
+{
+    fn size(&self) -> embedded_graphics::geometry::Size {
+        embedded_graphics::geometry::Size::new(self.width, self.height)
+    }
+}
+
+impl<'a, D> embedded_graphics::draw_target::DrawTarget for PpaLayeredFramebuffer<'a, D>
+where
+    D: embedded_graphics::draw_target::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>
+        + embedded_graphics::geometry::OriginDimensions,
+{
+    type Color = embedded_graphics::pixelcolor::Rgb565;
+    type Error = D::Error;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = embedded_graphics::Pixel<Self::Color>>,
+    {
+        if self.active_layers == 0 {
+            return self.base.draw_iter(pixels);
+        }
+        for embedded_graphics::Pixel(p, c) in pixels {
+            self.write_pixel(p.x, p.y, c)?;
+        }
+        Ok(())
+    }
+
+    fn fill_solid(
+        &mut self,
+        area: &embedded_graphics::primitives::Rectangle,
+        color: Self::Color,
+    ) -> Result<(), Self::Error> {
+        if self.active_layers == 0 {
+            return self.base.fill_solid(area, color);
+        }
+        let x0 = area.top_left.x.max(0) as u32;
+        let y0 = area.top_left.y.max(0) as u32;
+        let x1 = ((area.top_left.x + area.size.width as i32).max(0) as u32).min(self.width);
+        let y1 = ((area.top_left.y + area.size.height as i32).max(0) as u32).min(self.height);
+        let argb = rgb565_to_argb8888_opaque(color);
+        let buf = &mut self.pool[self.active_layers - 1];
+        let width = self.width as usize;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let off = (y as usize * width + x as usize) * 4;
+                unsafe {
+                    let ptr = buf.as_ptr_mut().add(off).cast::<u32>();
+                    core::ptr::write(ptr, argb);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
+        if self.active_layers == 0 {
+            return self.base.clear(color);
+        }
+        let argb = rgb565_to_argb8888_opaque(color);
+        let buf = &mut self.pool[self.active_layers - 1];
+        let pixels = (self.width as usize) * (self.height as usize);
+        unsafe {
+            let ptr = buf.as_ptr_mut().cast::<u32>();
+            for i in 0..pixels {
+                core::ptr::write(ptr.add(i), argb);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a, D> LayerStack for PpaLayeredFramebuffer<'a, D>
+where
+    D: embedded_graphics::draw_target::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>
+        + embedded_graphics::geometry::OriginDimensions,
+{
+    fn push_layer(&mut self, alpha: u8) {
+        // Grow the pool lazily on first use of each depth level.
+        if self.pool.len() <= self.active_layers {
+            let bytes = (self.width as usize) * (self.height as usize) * 4;
+            let buf = match PsramBuffer::new(bytes) {
+                Some(b) => b,
+                None => {
+                    // Out of PSRAM — track depth anyway so push/pop stay
+                    // balanced, but the layer's draws will fault on a
+                    // missing pool entry. Pragmatically fall back to
+                    // doing nothing (drawing skipped via a guard) is
+                    // cleaner; for now we panic to surface the problem.
+                    panic!("PpaLayeredFramebuffer: PSRAM exhausted on push_layer");
+                }
+            };
+            self.pool.push(buf);
+        }
+        // Zero the layer (alpha = 0 everywhere, i.e. fully transparent).
+        self.pool[self.active_layers].zero();
+        self.alphas.push(alpha);
+        self.active_layers += 1;
+    }
+
+    fn pop_layer_blend(&mut self) {
+        if self.active_layers == 0 {
+            return;
+        }
+        let alpha = self.alphas.pop().expect("alphas mirrors active_layers");
+        self.active_layers -= 1;
+        let depth = self.active_layers;
+
+        if depth == 0 {
+            // Bottom layer popping back to the base FB → PPA blend.
+            let src_ptr = self.pool[depth].as_ptr();
+            let _ = unsafe {
+                self.blend_target.blend_argb_over_rgb565(
+                    src_ptr,
+                    self.width,
+                    self.height,
+                    0,
+                    0,
+                    alpha,
+                )
+            };
+        } else {
+            // Nested layer → ARGB8888 composite onto the layer below.
+            // Our `PpaBlendTarget` is RGB565-output-only, so this falls
+            // back to a software composite. v0 limitation — see
+            // ROADMAP. Use `split_at_mut` to borrow source (immutably)
+            // and dest (mutably) concurrently without violating Rust's
+            // exclusive-borrow rule.
+            let (lower, upper) = self.pool.split_at_mut(depth);
+            let src_ptr = upper[0].as_ptr().cast::<u32>();
+            let dst_ptr = lower[depth - 1].as_ptr_mut().cast::<u32>();
+            let pixels = (self.width as usize) * (self.height as usize);
+            for i in 0..pixels {
+                unsafe {
+                    let s = core::ptr::read(src_ptr.add(i));
+                    let s_a = ((s >> 24) & 0xFF) as u32;
+                    if s_a == 0 {
+                        continue;
+                    }
+                    let eff = (s_a * alpha as u32 + 127) / 255;
+                    let d = core::ptr::read(dst_ptr.add(i));
+                    let d_a = ((d >> 24) & 0xFF) as u32;
+                    let inv = 255 - eff;
+                    let blend_ch =
+                        |sc: u32, dc: u32| -> u32 { (sc * eff + dc * inv + 127) / 255 };
+                    let r = blend_ch((s >> 16) & 0xFF, (d >> 16) & 0xFF);
+                    let g = blend_ch((s >> 8) & 0xFF, (d >> 8) & 0xFF);
+                    let b = blend_ch(s & 0xFF, d & 0xFF);
+                    // Output alpha: src eff + dst lit by inverse.
+                    let out_a = (eff + (d_a * inv + 127) / 255).min(255);
+                    let new = (out_a << 24) | (r << 16) | (g << 8) | b;
+                    core::ptr::write(dst_ptr.add(i), new);
+                }
+            }
+        }
+    }
+}
+
+/// Expand an RGB565 pixel into a packed ARGB8888 `u32` (host endian)
+/// with alpha = 255. Used by [`PpaLayeredFramebuffer`]'s DrawTarget impl
+/// when writing into a scratch layer.
+fn rgb565_to_argb8888_opaque(c: embedded_graphics::pixelcolor::Rgb565) -> u32 {
+    use embedded_graphics::pixelcolor::RgbColor;
+    let r = c.r() as u32; // 5 bits
+    let g = c.g() as u32; // 6 bits
+    let b = c.b() as u32; // 5 bits
+    let r8 = (r << 3) | (r >> 2);
+    let g8 = (g << 2) | (g >> 4);
+    let b8 = (b << 3) | (b >> 2);
+    (0xFFu32 << 24) | (r8 << 16) | (g8 << 8) | b8
 }
