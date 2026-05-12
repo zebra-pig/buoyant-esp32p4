@@ -24,7 +24,10 @@ use sys::ppa::{
 };
 
 pub use sys::ppa::{
-    ppa_blend_oper_config_t, ppa_fill_oper_config_t, ppa_operation_t,
+    ppa_blend_oper_config_t, ppa_fill_color_mode_t,
+    ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_ARGB8888,
+    ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_RGB565,
+    ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_RGB888, ppa_fill_oper_config_t, ppa_operation_t,
     ppa_operation_t_PPA_OPERATION_BLEND, ppa_operation_t_PPA_OPERATION_FILL,
     ppa_operation_t_PPA_OPERATION_SRM, ppa_srm_oper_config_t, ppa_trans_mode_t,
     ppa_trans_mode_t_PPA_TRANS_MODE_BLOCKING, ppa_trans_mode_t_PPA_TRANS_MODE_NON_BLOCKING,
@@ -243,3 +246,90 @@ pub fn msync_invalidate(ptr: *mut u8, size: usize) -> Result<(), sys::esp_err_t>
         e => Err(e),
     }
 }
+
+/// A bound output framebuffer the PPA fill engine can write into. Holds
+/// the borrowed [`Client`] (registered for `Operation::Fill`) plus the
+/// destination buffer metadata that doesn't change between frames:
+/// pointer, byte length, width, height, and the buffer's PPA color mode.
+///
+/// Per-frame work happens in [`Self::clear`]: it builds the
+/// [`ppa_fill_oper_config_t`], submits a blocking transaction, and
+/// invalidates the L1/L2 cache lines covering the destination so the
+/// CPU's next read (typically the blit that pushes pixels to the panel)
+/// sees the PPA's writes.
+///
+/// The pointer + size are NOT owned — the caller (typically a wrapper
+/// around the on-screen framebuffer) is responsible for keeping the
+/// allocation alive for the lifetime `'a`.
+pub struct PpaFillTarget<'a> {
+    client: &'a Client,
+    framebuffer_ptr: *mut u8,
+    framebuffer_bytes: usize,
+    width: u32,
+    height: u32,
+    color_mode: ppa_fill_color_mode_t,
+}
+
+impl<'a> PpaFillTarget<'a> {
+    /// Bind a fill client to a destination framebuffer.
+    ///
+    /// # Safety
+    /// `framebuffer_ptr` must point at a writable allocation of at least
+    /// `framebuffer_bytes` bytes, 64-byte aligned (use [`PsramBuffer`] or
+    /// `heap_caps_aligned_alloc(64, …, MALLOC_CAP_SPIRAM)`). The
+    /// allocation must remain valid for the entire lifetime `'a`.
+    pub unsafe fn new(
+        client: &'a Client,
+        framebuffer_ptr: *mut u8,
+        framebuffer_bytes: usize,
+        width: u32,
+        height: u32,
+        color_mode: ppa_fill_color_mode_t,
+    ) -> Self {
+        Self {
+            client,
+            framebuffer_ptr,
+            framebuffer_bytes,
+            width,
+            height,
+            color_mode,
+        }
+    }
+
+    /// Fill the entire framebuffer with `fill_val` (already encoded for
+    /// the buffer's color mode — e.g. an Rgb565 word packed into the low
+    /// 16 bits when [`Self`] was created with
+    /// [`ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_RGB565`]). Blocks
+    /// until the PPA finishes the transaction and the destination
+    /// cache lines are invalidated.
+    pub fn clear(&self, fill_val: u32) -> Result<(), sys::esp_err_t> {
+        // Build the per-frame config. The unions are zeroed via Default
+        // and then the active variant is set explicitly.
+        let mut out_anon = sys::ppa::ppa_out_pic_blk_config_t__bindgen_ty_1::default();
+        out_anon.fill_cm = self.color_mode;
+        let mut fill_anon = sys::ppa::ppa_fill_oper_config_t__bindgen_ty_1::default();
+        fill_anon.fill_color_val = fill_val;
+        let cfg = ppa_fill_oper_config_t {
+            out: sys::ppa::ppa_out_pic_blk_config_t {
+                buffer: self.framebuffer_ptr as *mut c_void,
+                buffer_size: self.framebuffer_bytes as u32,
+                pic_w: self.width,
+                pic_h: self.height,
+                block_offset_x: 0,
+                block_offset_y: 0,
+                __bindgen_anon_1: out_anon,
+                yuv_range: 0,
+                yuv_std: 0,
+            },
+            fill_block_w: self.width,
+            fill_block_h: self.height,
+            __bindgen_anon_1: fill_anon,
+            mode: ppa_trans_mode_t_PPA_TRANS_MODE_BLOCKING,
+            user_data: ptr::null_mut(),
+        };
+        self.client.do_fill(&cfg)?;
+        msync_invalidate(self.framebuffer_ptr, self.framebuffer_bytes)
+    }
+}
+
+unsafe impl<'a> Send for PpaFillTarget<'a> {}

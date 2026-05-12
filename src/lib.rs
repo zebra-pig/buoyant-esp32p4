@@ -82,6 +82,35 @@ where
     pub fn display_mut(&mut self) -> &mut D {
         self.inner.display_mut()
     }
+
+    /// Phase-4 fast-path: clear the whole framebuffer via the PPA fill
+    /// engine instead of looping per-pixel through `embedded-graphics`.
+    /// Call this once per frame before invoking
+    /// `buoyant::render::Render::render`, in place of a manual
+    /// `display.clear(...)` on the underlying [`DrawTarget`].
+    ///
+    /// `fill_val` is the raw word the buffer's pixel format expects —
+    /// e.g. a packed Rgb565 in the low 16 bits when [`fill_target`] was
+    /// configured with [`ppa::ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_RGB565`].
+    /// Returns `Err` if PPA dispatch fails; callers should fall back to
+    /// the software clear via [`buoyant::render_target::RenderTarget::clear`]
+    /// when that happens.
+    ///
+    /// Buoyant's internal `clear` calls inside `Render::render` still go
+    /// through the software path; those tend to be small region clears
+    /// for layer composition, where the PPA setup cost can outweigh the
+    /// fill itself. Phase 5+ adds inline PPA dispatch for the broader
+    /// shape/brush fast-paths.
+    ///
+    /// [`fill_target`]: ppa::PpaFillTarget
+    #[cfg(feature = "accel-ppa")]
+    pub fn ppa_clear(
+        &self,
+        fill_target: &ppa::PpaFillTarget<'_>,
+        fill_val: u32,
+    ) -> Result<(), esp_idf_sys::esp_err_t> {
+        fill_target.clear(fill_val)
+    }
 }
 
 impl<'a, D> RenderTarget for PpaRenderTarget<'a, D>
