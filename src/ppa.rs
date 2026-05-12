@@ -24,12 +24,16 @@ use sys::ppa::{
 };
 
 pub use sys::ppa::{
-    ppa_blend_oper_config_t, ppa_fill_color_mode_t,
-    ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_ARGB8888,
+    ppa_alpha_update_mode_t, ppa_alpha_update_mode_t_PPA_ALPHA_NO_CHANGE, ppa_blend_oper_config_t,
+    ppa_fill_color_mode_t, ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_ARGB8888,
     ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_RGB565,
     ppa_fill_color_mode_t_PPA_FILL_COLOR_MODE_RGB888, ppa_fill_oper_config_t, ppa_operation_t,
     ppa_operation_t_PPA_OPERATION_BLEND, ppa_operation_t_PPA_OPERATION_FILL,
-    ppa_operation_t_PPA_OPERATION_SRM, ppa_srm_oper_config_t, ppa_trans_mode_t,
+    ppa_operation_t_PPA_OPERATION_SRM, ppa_srm_color_mode_t,
+    ppa_srm_color_mode_t_PPA_SRM_COLOR_MODE_ARGB8888,
+    ppa_srm_color_mode_t_PPA_SRM_COLOR_MODE_RGB565,
+    ppa_srm_color_mode_t_PPA_SRM_COLOR_MODE_RGB888, ppa_srm_oper_config_t,
+    ppa_srm_rotation_angle_t_PPA_SRM_ROTATION_ANGLE_0, ppa_trans_mode_t,
     ppa_trans_mode_t_PPA_TRANS_MODE_BLOCKING, ppa_trans_mode_t_PPA_TRANS_MODE_NON_BLOCKING,
 };
 
@@ -346,6 +350,168 @@ impl<'a> PpaFillTarget<'a> {
 }
 
 unsafe impl<'a> Send for PpaFillTarget<'a> {}
+
+/// A bound output framebuffer the PPA scale-rotate-mirror engine can
+/// blit into. Parallel to [`PpaFillTarget`] but for image copies rather
+/// than solid fills: holds a borrowed [`Client`] (registered for
+/// [`Operation::Srm`]) plus the destination buffer's pointer, size,
+/// dimensions, and color mode.
+///
+/// Source buffers passed to [`Self::blit`] / [`Self::blit_scaled`] must
+/// be 64-byte aligned and live in DMA-capable memory (PSRAM or DRAM).
+/// The implementation flushes the source's cache lines before
+/// submitting and invalidates the destination's afterward, so the
+/// CPU's next read of either sees the final state.
+pub struct PpaSrmTarget<'a> {
+    client: &'a Client,
+    framebuffer_ptr: *mut u8,
+    framebuffer_bytes: usize,
+    width: u32,
+    height: u32,
+    color_mode: ppa_srm_color_mode_t,
+}
+
+impl<'a> PpaSrmTarget<'a> {
+    /// Bind an SRM client to a destination framebuffer.
+    ///
+    /// # Safety
+    /// Same constraints as [`PpaFillTarget::new`].
+    pub unsafe fn new(
+        client: &'a Client,
+        framebuffer_ptr: *mut u8,
+        framebuffer_bytes: usize,
+        width: u32,
+        height: u32,
+        color_mode: ppa_srm_color_mode_t,
+    ) -> Self {
+        Self {
+            client,
+            framebuffer_ptr,
+            framebuffer_bytes,
+            width,
+            height,
+            color_mode,
+        }
+    }
+
+    /// 1:1 blit a source image into the framebuffer at `(dst_x, dst_y)`.
+    ///
+    /// The source is interpreted as a packed pixel grid of `src_w * src_h`
+    /// pixels in the SRM target's color mode. Equivalent to
+    /// [`Self::blit_scaled`] with `dst_w = src_w` and `dst_h = src_h`.
+    ///
+    /// # Safety
+    /// `src_ptr` must point at a writable allocation of at least
+    /// `src_w * src_h * bytes_per_pixel` bytes, 64-byte aligned. The
+    /// allocation must remain valid for the duration of the call (the
+    /// PPA transaction is submitted in blocking mode so the function
+    /// returns only once the read is complete). Bytes-per-pixel is
+    /// implied by the color mode passed to [`Self::new`].
+    pub unsafe fn blit(
+        &self,
+        src_ptr: *const u8,
+        src_w: u32,
+        src_h: u32,
+        dst_x: u32,
+        dst_y: u32,
+    ) -> Result<(), sys::esp_err_t> {
+        self.blit_scaled(src_ptr, src_w, src_h, dst_x, dst_y, src_w, src_h)
+    }
+
+    /// Scaled blit: read `src_w × src_h` from `src_ptr` and write
+    /// `dst_w × dst_h` at `(dst_x, dst_y)` on the framebuffer. Scale
+    /// factors are computed from the size ratios. The PPA supports
+    /// arbitrary positive scales; the ESP-IDF v5.5 driver clamps
+    /// extreme ratios internally.
+    ///
+    /// # Safety
+    /// Same as [`Self::blit`] regarding `src_ptr` lifetime and
+    /// alignment.
+    pub unsafe fn blit_scaled(
+        &self,
+        src_ptr: *const u8,
+        src_w: u32,
+        src_h: u32,
+        dst_x: u32,
+        dst_y: u32,
+        dst_w: u32,
+        dst_h: u32,
+    ) -> Result<(), sys::esp_err_t> {
+        let bpp = srm_bytes_per_pixel(self.color_mode);
+        let src_bytes = (src_w as usize) * (src_h as usize) * bpp;
+
+        // Flush source cache lines so the PPA reads what the CPU just
+        // wrote. Source is treated as immutable for the duration of
+        // the transaction.
+        msync_flush(src_ptr, src_bytes)?;
+
+        let mut in_anon = sys::ppa::ppa_in_pic_blk_config_t__bindgen_ty_1::default();
+        in_anon.srm_cm = self.color_mode;
+        let mut out_anon = sys::ppa::ppa_out_pic_blk_config_t__bindgen_ty_1::default();
+        out_anon.srm_cm = self.color_mode;
+
+        let scale_x = dst_w as f32 / src_w as f32;
+        let scale_y = dst_h as f32 / src_h as f32;
+
+        let cfg = ppa_srm_oper_config_t {
+            in_: sys::ppa::ppa_in_pic_blk_config_t {
+                buffer: src_ptr as *const c_void,
+                pic_w: src_w,
+                pic_h: src_h,
+                block_w: src_w,
+                block_h: src_h,
+                block_offset_x: 0,
+                block_offset_y: 0,
+                __bindgen_anon_1: in_anon,
+                yuv_range: 0,
+                yuv_std: 0,
+            },
+            out: sys::ppa::ppa_out_pic_blk_config_t {
+                buffer: self.framebuffer_ptr as *mut c_void,
+                buffer_size: self.framebuffer_bytes as u32,
+                pic_w: self.width,
+                pic_h: self.height,
+                block_offset_x: dst_x,
+                block_offset_y: dst_y,
+                __bindgen_anon_1: out_anon,
+                yuv_range: 0,
+                yuv_std: 0,
+            },
+            rotation_angle: ppa_srm_rotation_angle_t_PPA_SRM_ROTATION_ANGLE_0,
+            scale_x,
+            scale_y,
+            mirror_x: false,
+            mirror_y: false,
+            rgb_swap: false,
+            byte_swap: false,
+            alpha_update_mode: ppa_alpha_update_mode_t_PPA_ALPHA_NO_CHANGE,
+            __bindgen_anon_1: core::mem::zeroed(),
+            mode: ppa_trans_mode_t_PPA_TRANS_MODE_BLOCKING,
+            user_data: ptr::null_mut(),
+        };
+        self.client.do_srm(&cfg)?;
+        msync_invalidate(self.framebuffer_ptr, self.framebuffer_bytes)
+    }
+}
+
+unsafe impl<'a> Send for PpaSrmTarget<'a> {}
+
+/// Bytes per pixel for an SRM color mode. Only the RGB modes are
+/// supported here; YUV needs more careful range/standard handling and
+/// can be added when there's a concrete need.
+fn srm_bytes_per_pixel(mode: ppa_srm_color_mode_t) -> usize {
+    if mode == ppa_srm_color_mode_t_PPA_SRM_COLOR_MODE_RGB565 {
+        2
+    } else if mode == ppa_srm_color_mode_t_PPA_SRM_COLOR_MODE_RGB888 {
+        3
+    } else if mode == ppa_srm_color_mode_t_PPA_SRM_COLOR_MODE_ARGB8888 {
+        4
+    } else {
+        // Best-effort fallback; the PPA will reject mis-sized buffers
+        // on dispatch anyway.
+        2
+    }
+}
 
 /// `embedded-graphics` [`DrawTarget`] wrapper that intercepts
 /// [`DrawTarget::fill_solid`] for sufficiently large rectangles and

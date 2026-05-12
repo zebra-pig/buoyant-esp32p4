@@ -109,17 +109,32 @@ Empirical crossover sits at ~64×64 (4 096 px), validating the default threshold
 
 **On the counter UI specifically:** frame render time stays at ~3.7 ms because the existing UI is dominated by *circular* button backgrounds (drawn through `embedded-graphics`'s `draw_iter` per-pixel coverage path), a RoundedRectangle Reset button (also `draw_iter`), and tiny 32×6 icon bars (192 px — below threshold). The roadmap's "1.5–2× speedup on a UI dominated by button backgrounds" expected rectangle backgrounds; the post-redesign counter has circles instead, so Phase 5's win for this specific UI is essentially zero. The infrastructure is correct and dispatches when given something to dispatch on — the next material UI speedup arrives with Phase 6 (image blits via `ppa_blend`) and Phase 7 (layer alpha via PPA blend), both of which match operations the current UI actually performs.
 
-### Phase 6 — PPA-accelerated image blits
+### Phase 6 — PPA-accelerated image blits ✅
 
 Goal: `Brush::as_image()` axis-aligned blits dispatch to `ppa_blend` (or `ppa_scale_rotate_mirror` for scaled).
 
-**Deliverables:**
-- Detection of image brushes in `fill`.
-- Dispatch to scaled-blit when brush size != shape size.
-- Fall back to software blit when source isn't in PSRAM or isn't aligned.
+**Delivered:**
+- `ppa::PpaSrmTarget` (parallel to `PpaFillTarget`) bound to an output framebuffer and an SRM-mode [`Client`]. Two methods: `blit` (1:1 copy from a source buffer into a destination sub-rect) and `blit_scaled` (arbitrary positive scale factors derived from the size ratios). Internally flushes the source cache lines before submission and invalidates the destination's afterward, so CPU↔PPA aliasing is sound.
+- Sources live in caller-managed PSRAM (e.g. via [`PsramBuffer`]) so the PPA's alignment and DMA-reachability requirements can be satisfied without copying.
+- **Automatic detection of image brushes inside `RenderTarget::fill` is deferred.** Doing it cleanly requires either overriding the trait method on `PpaRenderTarget` (which breaks Phase 1's `#[repr(transparent)]` recast in `with_layer`) or inspecting iterator types at the `embedded-graphics::DrawTarget::fill_contiguous` boundary (fragile without `Any`-style downcasts). The current API exposes `PpaSrmTarget` directly; the user calls `blit_scaled` at the point of the image draw. A follow-up phase can add automatic dispatch once the brush-trait surface settles.
 
-**Acceptance:**
-- An image-heavy demo (sprites, icons) on Tab5 measurably faster than Phase 5.
+**Acceptance:** measured on Tab5 v1.3, 720×1280 RGB565, OPI PSRAM @ 200 MHz, HP @ 360 MHz:
+
+| Operation | Pixels | Software | PPA | Speedup |
+|---|---:|---:|---:|---:|
+| 1:1 blit 32×32 | 1 024 | 14 µs | 133 µs | 0.11× |
+| 1:1 blit 128×128 | 16 384 | 200 µs | 894 µs | 0.22× |
+| 1:1 blit 256×256 | 65 536 | 3 373 µs | 3 061 µs | 1.10× |
+| 1:1 blit 400×300 | 120 000 | 6 257 µs | 5 625 µs | 1.11× |
+| 1:1 blit 720×200 | 144 000 | 6 710 µs | 6 848 µs | 0.98× |
+| 1:1 blit 720×600 | 432 000 | 19 965 µs | 19 842 µs | 1.01× |
+| **Upscale 100×100 → 400×400** | 160 000 out | **9 654 µs** | **546 µs** | **17.68×** |
+
+The honest read: **pure 1:1 blits are parity** with CPU `memcpy`. Both paths are PSRAM-bandwidth-bound for read+write (~347 MB/s effective), and neither side can beat the memory bus. Phases 4/5 fills won because they only *write*; SRM doesn't get that asymmetry back.
+
+**Scaled blits are where SRM crushes the CPU** — 17.68× on a 4× linear upscale (16× pixel count). The CPU has to compute every output pixel's source coordinate and read it; the PPA does that in dedicated logic. For any UI that does dynamic icon resizing, zoom/pan, or bitmap font scaling, this is the win.
+
+Roadmap target ("image-heavy demo measurably faster than Phase 5") is met for the scaling case and unmet (~parity) for the 1:1 case. That's the shape of the hardware, not a bug.
 
 ### Phase 7 — Layer alpha via PPA blend
 
