@@ -283,9 +283,12 @@ impl<'a> PpaFillTarget<'a> {
     ///
     /// # Safety
     /// `framebuffer_ptr` must point at a writable allocation of at least
-    /// `framebuffer_bytes` bytes, 64-byte aligned (use [`PsramBuffer`] or
-    /// `heap_caps_aligned_alloc(64, …, MALLOC_CAP_SPIRAM)`). The
-    /// allocation must remain valid for the entire lifetime `'a`.
+    /// `framebuffer_bytes` bytes, [`CACHE_LINE`]-aligned (use
+    /// [`PsramBuffer`] or `heap_caps_aligned_alloc(64, …, MALLOC_CAP_SPIRAM)`).
+    /// The allocation must remain valid for the entire lifetime `'a`.
+    /// A debug build asserts the alignment; a release build trusts the
+    /// caller (the PPA driver will reject misaligned buffers at
+    /// dispatch time with an `ESP_ERR_INVALID_ARG`).
     pub unsafe fn new(
         client: &'a Client,
         framebuffer_ptr: *mut u8,
@@ -294,6 +297,14 @@ impl<'a> PpaFillTarget<'a> {
         height: u32,
         color_mode: ppa_fill_color_mode_t,
     ) -> Self {
+        debug_assert!(
+            (framebuffer_ptr as usize) % CACHE_LINE == 0,
+            "PpaFillTarget framebuffer must be {CACHE_LINE}-byte aligned, got {framebuffer_ptr:p}"
+        );
+        debug_assert!(
+            framebuffer_bytes >= (width as usize) * (height as usize) * 2,
+            "PpaFillTarget framebuffer_bytes ({framebuffer_bytes}) too small for {width}x{height}"
+        );
         Self {
             client,
             framebuffer_ptr,
@@ -388,6 +399,10 @@ impl<'a> PpaSrmTarget<'a> {
         height: u32,
         color_mode: ppa_srm_color_mode_t,
     ) -> Self {
+        debug_assert!(
+            (framebuffer_ptr as usize) % CACHE_LINE == 0,
+            "PpaSrmTarget framebuffer must be {CACHE_LINE}-byte aligned, got {framebuffer_ptr:p}"
+        );
         Self {
             client,
             framebuffer_ptr,
@@ -531,6 +546,10 @@ impl<'a> PpaBlendTarget<'a> {
         width: u32,
         height: u32,
     ) -> Self {
+        debug_assert!(
+            (framebuffer_ptr as usize) % CACHE_LINE == 0,
+            "PpaBlendTarget framebuffer must be {CACHE_LINE}-byte aligned, got {framebuffer_ptr:p}"
+        );
         Self {
             client,
             framebuffer_ptr,

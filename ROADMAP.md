@@ -236,13 +236,24 @@ Goal: same as Phase 9, for the Seeed reTerminal D1001.
 **Acceptance:**
 - Exact same example code (less the BSP::take call) runs on both Tab5 and D1001 — proving the SoC-level abstraction.
 
-### Phase 11 — Polish
+### Phase 11 — Polish ✅ (publish gated on user authorization)
 
-- Alignment guarantees enforced by `Framebuffer` constructor.
-- Cache flush sequencing verified against the IDF docs.
-- Tearing edge cases (cf. lvgl/lvgl#9046 for known PPA pitfalls).
-- Benchmarks in `bench/`.
-- Crates.io publish: `0.1.0` once Phase 4–8 are landed.
+**Delivered:**
+- Alignment guarantees: `PpaFillTarget::new`, `PpaSrmTarget::new`, `PpaBlendTarget::new` now `debug_assert!` that `framebuffer_ptr` is `CACHE_LINE`-aligned (64 bytes), so misaligned buffers fail fast in debug builds rather than producing PPA dispatch errors at runtime. Release builds trust the caller; the PPA driver rejects misaligned buffers with `ESP_ERR_INVALID_ARG` regardless.
+- Cache flush sequencing: `PpaSrmTarget::blit_scaled` and `PpaBlendTarget::blend_argb_over_rgb565` now `msync_flush` both source and destination before submission (the bg buffer is also read by the PPA for blends), then `msync_invalidate` the destination after. The fill path doesn't need source flushing because it doesn't read.
+- Documentation: module-level crate docs in `src/lib.rs` enumerate the two render targets, the `ppa` building blocks, and feature flag implications; README.md gets a worked usage example + measured-speedups table + v0 limitations section.
+- `CHANGELOG.md` summarises the 0.1.0 release.
+- `Cargo.toml`: `include` list for the published artifact, all required metadata fields (description, license, repository, keywords, categories, readme) present.
+- Version bumped to **0.1.0** from 0.0.1.
+
+**Validation:** `cargo publish --dry-run --allow-dirty` packages cleanly (144.7 KiB / 43 KiB compressed, 11 files) and the verification rebuild succeeds.
+
+**Crates.io publish:** intentionally not yet performed — it's an irreversible action and the user owns that decision. Once authorised, the publish is a single `cargo publish` command from the crate root.
+
+**Deferred to a future minor version (0.2.0):**
+- Tearing edge cases — covered structurally by Phase 8's double-buffering on the firmware side; no LVGL-style edge cases observed in our usage. Will revisit if a continuous-animation demo surfaces issues.
+- Standalone benches in `bench/` — currently in-firmware as boot diagnostics, which is the more honest measurement environment (real PSRAM, real PPA, real frame budget). A `criterion`-style host bench wouldn't measure anything meaningful since the PPA only exists on P4 silicon.
+- Phase 10 — `bsp-d1001` companion crate. Requires a Seeed reTerminal D1001 on the bench; untestable without one. The architecture is a near-copy of `bsp-tab5` with a different ESP-IDF BSP component name.
 
 ## Performance targets
 

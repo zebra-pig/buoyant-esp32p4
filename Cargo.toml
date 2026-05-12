@@ -1,6 +1,6 @@
 [package]
 name = "buoyant-esp32p4"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.79"
 description = "Hardware-accelerated Buoyant render target for ESP32-P4 (PPA + MIPI-DSI)."
@@ -9,6 +9,15 @@ repository = "https://github.com/zebra-pig/buoyant-esp32p4"
 keywords = ["buoyant", "esp32", "esp32p4", "embedded", "graphics"]
 categories = ["embedded", "no-std", "graphics"]
 readme = "README.md"
+include = [
+    "src/**/*",
+    "include/**/*",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "ROADMAP.md",
+    "CHANGELOG.md",
+]
 
 [dependencies]
 # Upstream UI framework. The crate exposes the `RenderTarget` trait we

@@ -1,12 +1,42 @@
-//! Hardware-accelerated Buoyant render target for ESP32-P4.
+//! Hardware-accelerated [Buoyant](https://github.com/riley-williams/buoyant)
+//! render target for the ESP32-P4. Dispatches solid rectangle fills,
+//! image blits, alpha blends, and layer composition to the chip's PPA
+//! (Pixel Processing Accelerator); falls back to the upstream
+//! [`EmbeddedGraphicsRenderTarget`] software path for everything else.
 //!
-//! This crate plugs into Buoyant by implementing
-//! [`buoyant::render_target::RenderTarget`]. Future phases dispatch
-//! qualifying operations to the ESP32-P4 PPA (Pixel Processing
-//! Accelerator); the current phase delegates everything to
-//! [`EmbeddedGraphicsRenderTarget`] so the trait wiring is verifiable on
-//! any chip while the PPA path is built up. See `ROADMAP.md` for the
-//! phased plan.
+//! # Two render targets
+//!
+//! - [`PpaRenderTarget`] — `#[repr(transparent)]` over
+//!   `EmbeddedGraphicsRenderTarget`. Software-only. Use this when you
+//!   don't need opacity acceleration but want the option to swap in
+//!   PPA-aware targets later without restructuring your render loop.
+//! - [`PpaLayeredRenderTarget`] — same layout, but overrides
+//!   `with_layer` to dispatch `view.opacity(α)` to the PPA blend
+//!   engine. Requires the inner DrawTarget to implement
+//!   [`ppa::LayerStack`] (use [`ppa::PpaLayeredFramebuffer`]).
+//!
+//! # The [`ppa`] module
+//!
+//! Provides the building blocks: [`ppa::Client`] (registered for one
+//! of fill / blend / scale-rotate-mirror), per-operation targets
+//! ([`ppa::PpaFillTarget`], [`ppa::PpaBlendTarget`],
+//! [`ppa::PpaSrmTarget`]), and embedded-graphics adapters that
+//! intercept calls at the right level
+//! ([`ppa::PpaDrawTarget`] for `fill_solid`, [`ppa::PpaLayeredFramebuffer`]
+//! for `with_layer`). Plus [`ppa::PsramBuffer`] and
+//! [`ppa::msync_flush`] / [`ppa::msync_invalidate`] for cache coherency.
+//!
+//! # Feature flags
+//!
+//! - `std` — enables Buoyant's `std` features; required when targeting esp-idf.
+//! - `esp-idf` — pulls in `esp-idf-sys`. Implies `std`.
+//! - `accel-ppa` — enables the PPA fast-paths and the [`ppa`] module.
+//!   Implies `esp-idf`. **Requires** ESP-IDF v5.5+ and the
+//!   `riscv32imafc-esp-espidf` target (ESP32-P4). On other ESP32 chips
+//!   the PPA peripheral doesn't exist and the symbols will fail to link.
+//!
+//! See [`ROADMAP.md`](https://github.com/zebra-pig/buoyant-esp32p4/blob/main/ROADMAP.md)
+//! for per-phase measurements and v0 limitations.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
