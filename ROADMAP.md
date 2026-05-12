@@ -48,16 +48,13 @@ Goal: a working `RenderTarget` impl that proves the wiring without any accelerat
 
 **Why this phase exists:** lock the trait wiring before adding hardware. If Buoyant's trait is too restrictive for what we need, we discover it here, not after writing PPA glue.
 
-### Phase 2 — Run the wrapper on a real ESP32-S3 (CoreS3 SE)
+### Phase 2 — Run the wrapper on real hardware ✅
 
-Goal: validate the wrapper end-to-end on hardware we already have, with no PPA involvement.
+Goal: validate the wrapper end-to-end on hardware we have, with no PPA involvement.
 
-**Deliverables:**
-- Example `examples/cores3-counter/` (a small bin crate or path-style test rig) that re-uses the existing `rlvgl-starter`'s `ui` crate but routes rendering through `PpaRenderTarget` instead of `EmbeddedGraphicsRenderTarget`.
-- Documented in README that this is for development convenience, not production.
+Originally scoped for CoreS3 SE because Tab5 wasn't on the bench yet. With a Tab5 now available the validation moved directly to the target hardware: `rlvgl-starter`'s `firmware-tab5` imports `buoyant-esp32p4` by path and routes Buoyant rendering through `PpaRenderTarget::new(&mut adapter)` instead of `EmbeddedGraphicsRenderTarget::new(...)`. The counter UI behaves identically on the Tab5: panel comes up via the M5Stack BSP, GT911/ST7123 touch events drive Buoyant's event loop, and `state.count` increments/decrements through the wrapper with no visual regressions.
 
-**Acceptance:**
-- Counter UI flashes onto the CoreS3 SE and renders identically to the rlvgl-starter baseline. Touch still works. No new visual regressions.
+**Acceptance:** met. Tab5 v1.3 silicon, 720×1280 MIPI-DSI, software path through `PpaRenderTarget`. No PPA dispatches yet — that's Phase 4+.
 
 ### Phase 3 — esp-idf-sys + PPA driver wrapper module
 

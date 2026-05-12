@@ -12,7 +12,7 @@ The crate is **board-agnostic**: it targets the ESP32-P4 SoC. Per-board panel + 
 
 ## Status
 
-Phase 1 complete: `PpaRenderTarget` implements `buoyant::render_target::RenderTarget` as a transparent wrapper over `EmbeddedGraphicsRenderTarget`, behaving identically to the upstream software path. PPA dispatch and the MIPI-DSI present pipeline arrive in subsequent commits.
+Phase 2 complete: `PpaRenderTarget` is validated end-to-end on real ESP32-P4 silicon (M5Stack Tab5) via `rlvgl-starter/firmware-tab5`, which depends on this crate by path and routes Buoyant rendering through the wrapper. The counter UI renders and accepts touch input identically to the direct-`EmbeddedGraphicsRenderTarget` path. PPA dispatch arrives in subsequent commits (Phase 3+).
 
 See [`ROADMAP.md`](ROADMAP.md) for the phased plan and acceptance criteria per phase.
 
